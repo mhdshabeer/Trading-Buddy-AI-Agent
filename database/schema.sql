@@ -1,0 +1,2 @@
+-- SQL schema placeholder.
+-- Add CREATE TABLE statements here.
