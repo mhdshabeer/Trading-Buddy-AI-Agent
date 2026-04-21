@@ -26,4 +26,4 @@ An AI-powered trading assistant that journals trades via voice, provides market 
 - LangChain + MCP
 - MetaTrader 5
 - PostgreSQL / Notion
-- Docker + AWS (planned)
+- Docker + AWS (planned for v2)
