@@ -14,8 +14,8 @@ An AI-powered trading assistant that journals trades via voice, provides on-dema
 | MT5 direct connection | ✅ |
 | MT5 as LangChain tool | ✅ |
 | MT5 as MCP server | ✅ |
-| Telegram MCP – send_message | ✅ |
-| Telegram MCP – poll_updates | ✅ |
+| Telegram MCP – `send_message` | ✅ |
+| Telegram MCP – `poll_updates` | ✅ |
 | File-based memory for Telegram | ✅ |
 | Polling client (no LLM, stable) | ✅ |
 
@@ -25,43 +25,37 @@ Next up (Day 3):
 
 ---
 
-## 📁 Project Structure
+## 🧠 Key Technical Decisions
 
-trading-buddy-ai/
-├── src/
-│   ├── mcp_servers/
-│   │   ├── mt5_mcp.py
-│   │   └── telegram_mcp.py
-│   └── ...
-├── scripts/
-│   ├── 01_llm_only.py
-│   ├── 02_agent_no_tools.py
-│   ├── 03_agent_fake_tool.py
-│   ├── 04_mt5_direct.py
-│   ├── 05_agent_mt5_tool.py
-│   ├── 06_mcp_client.py
-│   └── test_telegram_polling.py
-├── .env
-├── .gitignore
-├── requirements.txt
-└── README.md
+- Telegram polling uses file-based memory (last_update_id.txt) to avoid re-processing old messages.
+- No LLM in the polling loop – direct tool invocation prevents unwanted replies and infinite loops.
+- MCP servers run as subprocesses – clean separation of concerns.
 
 ---
 
-## 🧪 How to Run
+## 📌 Notes
 
-.env:
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_numeric_chat_id
-GROQ_API_KEY=your_groq_key
-
-pip install -r requirements.txt
-python scripts/test_telegram_polling.py
+- MT5 must be open and logged in on your Windows PC for MT5 tools to work.
+- The Telegram bot must have started a conversation with you (send /start once).
+- All components run locally for now. Docker + AWS come later (v2).
 
 ---
 
-## Notes
+## 📅 Next Milestones
 
-- MT5 must be open and logged in
-- Start Telegram bot with /start
-- Runs locally (Docker/AWS later)
+- /digest command – fetch economic calendar + news → LLM summary → send to Telegram
+- Voice memo handling – download audio → Whisper → LLM extract trade psychology
+- PostgreSQL MCP server – store trades for analytics
+- Notion MCP server – mirror journal for readability
+- MT5 polling loop – detect new closed trades automatically
+
+---
+
+## 🛠️ Built With
+
+- Groq – Llama 3.3 70B, Whisper
+- LangChain + langchain-mcp-adapters
+- MCP (Model Context Protocol)
+- MetaTrader 5
+- Telegram Bot API
+- Python 3.13, httpx, python-dotenv
