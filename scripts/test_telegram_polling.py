@@ -1,8 +1,9 @@
-# scripts/test_telegram_polling.py (fixed – unwraps MCP TextContent)
+# scripts/test_telegram_polling.py
 import asyncio
 import json
 import os
 import sys
+from datetime import datetime
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 import httpx
@@ -10,23 +11,46 @@ from groq import Groq
 
 load_dotenv()
 
-# ---------- Digest Generation ----------
+# ---------- Digest Generation (today's events only, sorted by impact) ----------
 async def generate_digest() -> str:
-    """Fetch economic calendar + news and return LLM-generated summary."""
+    """Fetch economic calendar + news, prepend current date, return LLM summary.
+    Filters only today's events and prioritises high-impact (red folder) news.
+    """
+    today_date = datetime.now().strftime("%A, %B %d, %Y")
+    today_str = datetime.now().strftime("%Y-%m-%d")  # format used in JSON
+
+    # 1. Economic calendar (Forex Factory)
     eco_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     eco_events = []
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(eco_url)
             data = resp.json()
-            for event in data[:5]:
+            # Filter for today's events
+            today_events = []
+            for event in data:
+                event_date = event.get('date', '')[:10]
+                if event_date == today_str:
+                    today_events.append(event)
+            # Sort by impact (High > Medium > Low)
+            impact_order = {'High': 0, 'Medium': 1, 'Low': 2, '': 3}
+            today_events.sort(key=lambda x: impact_order.get(x.get('impact', ''), 3))
+            # Build formatted list
+            for event in today_events[:10]:
                 country = event.get('country', '')
                 title = event.get('title', '')
                 impact = event.get('impact', '')
-                eco_events.append(f"{country}: {title} - Impact: {impact}")
+                if impact == 'High':
+                    impact_display = '🔴 High'
+                elif impact == 'Medium':
+                    impact_display = '🟠 Medium'
+                else:
+                    impact_display = '🟡 Low'
+                eco_events.append(f"{country}: {title} - {impact_display}")
     except Exception as e:
         eco_events = [f"Error fetching economic calendar: {e}"]
 
+    # 2. Market news (Finnhub)
     finnhub_key = os.getenv("FINNHUB_API_KEY")
     news_items = []
     if finnhub_key:
@@ -42,19 +66,26 @@ async def generate_digest() -> str:
     else:
         news_items = ["No Finnhub API key found. Skipping news."]
 
-    eco_text = "\n".join(eco_events) if eco_events else "No economic events today."
+    # 3. Build prompt for LLM
+    if eco_events:
+        eco_text = "\n".join(eco_events)
+    else:
+        eco_text = "No high‑impact economic events scheduled for today."
+
     news_text = "\n".join(news_items) if news_items else "No news available."
 
     prompt = f"""You are a trading assistant. Create a very short morning market digest (max 150 words) based on:
-Economic events today:
+
+Today's economic events (priority sorted by impact):
 {eco_text}
 
 Market news:
 {news_text}
 
-Highlight high-impact events. Be concise and actionable for a trader. End with a one-sentence recommendation.
+Highlight the most impactful events. Be concise and actionable for a trader. End with a one-sentence recommendation.
 """
 
+    # 4. Call Groq
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     try:
         completion = groq_client.chat.completions.create(
@@ -62,11 +93,12 @@ Highlight high-impact events. Be concise and actionable for a trader. End with a
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
-        return completion.choices[0].message.content
+        digest_body = completion.choices[0].message.content
+        return f"📅 {today_date}\n\n{digest_body}"
     except Exception as e:
         return f"❌ LLM failed: {str(e)}"
 
-# ---------- Main Polling Loop (with correct unwrapping) ----------
+# ---------- Main Polling Loop (simplified commands: digest, /digest, news, /news) ----------
 async def main():
     client = MultiServerMCPClient({
         "telegram": {
@@ -84,19 +116,19 @@ async def main():
         print("❌ Required tools not found")
         return
 
-    print("Listening for messages... Send /digest for market briefing.\n")
+    # Allowed commands (case‑insensitive)
+    allowed_commands = {"digest", "/digest", "news", "/news"}
+
+    print("Listening for messages... Send 'digest' or 'news' to get market briefing.\n")
 
     while True:
         result = await poll_tool.ainvoke({})
-        # result is a list of ToolMessage/TextContent objects
         content = result.content if hasattr(result, 'content') else result
 
-        # Unwrap MCP response: content may be a list of dicts with 'text' field
         updates_raw = []
         if isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and "text" in item:
-                    # item["text"] is the JSON string from poll_updates
                     try:
                         parsed = json.loads(item["text"])
                         if isinstance(parsed, list):
@@ -111,11 +143,10 @@ async def main():
             except:
                 pass
 
-        # Now updates_raw is a list of actual Telegram update objects
         for upd in updates_raw:
             print(f"📩 Received: {upd}")
-            text = upd.get("text")
-            if text == "/digest":
+            text = upd.get("text", "").strip().lower()
+            if text in allowed_commands:
                 print("   → Generating digest...")
                 digest = await generate_digest()
                 await send_tool.ainvoke({"text": digest})
