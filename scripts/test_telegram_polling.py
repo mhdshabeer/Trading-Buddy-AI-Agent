@@ -3,54 +3,68 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 import httpx
 from groq import Groq
+import pytz
+import re
 
 load_dotenv()
 
-# ---------- Digest Generation (today's events only, sorted by impact) ----------
-async def generate_digest() -> str:
-    """Fetch economic calendar + news, prepend current date, return LLM summary.
-    Filters only today's events and prioritises high-impact (red folder) news.
-    """
-    today_date = datetime.now().strftime("%A, %B %d, %Y")
-    today_str = datetime.now().strftime("%Y-%m-%d")  # format used in JSON
+# ---------- Robust UTC → IST converter (handles ISO and legacy formats) ----------
+def utc_to_ist(time_str: str) -> str:
+    """Convert various UTC datetime formats to IST time string (HH:MM AM/PM)."""
+    if not time_str or time_str == "Time TBA":
+        return "Time TBA"
+    try:
+        # Try ISO format with timezone (e.g., 2026-04-19T18:45:00-04:00)
+        if 'T' in time_str and ('+' in time_str or '-' in time_str[10:]):
+            dt_utc = datetime.fromisoformat(time_str)
+            # Convert to UTC if it has offset
+            dt_utc = dt_utc.astimezone(timezone.utc)
+        # Try legacy format "YYYY-MM-DD HH:MM:SS"
+        elif re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', time_str):
+            dt_utc = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        else:
+            return "Time TBA"
+        # Convert to IST
+        ist = pytz.timezone('Asia/Kolkata')
+        dt_ist = dt_utc.astimezone(ist)
+        return dt_ist.strftime("%I:%M %p").lstrip('0')
+    except Exception:
+        return "Time TBA"
 
-    # 1. Economic calendar (Forex Factory)
+# ---------- Digest Generation ----------
+async def generate_digest() -> str:
+    today_date = datetime.now().strftime("%A, %B %d, %Y")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
     eco_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    eco_events = []
+    high_impact_events = []
+    all_events_summary = []
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(eco_url)
             data = resp.json()
-            # Filter for today's events
-            today_events = []
-            for event in data:
-                event_date = event.get('date', '')[:10]
-                if event_date == today_str:
-                    today_events.append(event)
-            # Sort by impact (High > Medium > Low)
-            impact_order = {'High': 0, 'Medium': 1, 'Low': 2, '': 3}
-            today_events.sort(key=lambda x: impact_order.get(x.get('impact', ''), 3))
-            # Build formatted list
-            for event in today_events[:10]:
+            today_events = [e for e in data if e.get('date', '')[:10] == today_str]
+            for event in today_events:
                 country = event.get('country', '')
                 title = event.get('title', '')
                 impact = event.get('impact', '')
+                # Use the full datetime from 'date' field (may be ISO)
+                full_datetime = event.get('date', '')
+                time_ist = utc_to_ist(full_datetime)
                 if impact == 'High':
-                    impact_display = '🔴 High'
-                elif impact == 'Medium':
-                    impact_display = '🟠 Medium'
-                else:
-                    impact_display = '🟡 Low'
-                eco_events.append(f"{country}: {title} - {impact_display}")
+                    high_impact_events.append(f"{country} - {title} - {time_ist}")
+                all_events_summary.append(f"{country} {title} ({impact} impact)")
     except Exception as e:
-        eco_events = [f"Error fetching economic calendar: {e}"]
+        high_impact_events = [f"Error fetching calendar: {e}"]
+        all_events_summary = ["Economic data unavailable"]
 
-    # 2. Market news (Finnhub)
+    # Finnhub news
     finnhub_key = os.getenv("FINNHUB_API_KEY")
     news_items = []
     if finnhub_key:
@@ -66,26 +80,19 @@ async def generate_digest() -> str:
     else:
         news_items = ["No Finnhub API key found. Skipping news."]
 
-    # 3. Build prompt for LLM
-    if eco_events:
-        eco_text = "\n".join(eco_events)
-    else:
-        eco_text = "No high‑impact economic events scheduled for today."
-
+    # LLM prompt
+    eco_summary = "\n".join(all_events_summary) if all_events_summary else "No economic events today."
     news_text = "\n".join(news_items) if news_items else "No news available."
 
-    prompt = f"""You are a trading assistant. Create a very short morning market digest (max 150 words) based on:
+    prompt = f"""You are a trading assistant. Based on the following economic events and market news, write ONE short paragraph (max 100 words) describing the current economic state and what traders should watch. Do NOT list the events again. End with a one-sentence actionable recommendation.
 
-Today's economic events (priority sorted by impact):
-{eco_text}
+Economic events today:
+{eco_summary}
 
 Market news:
 {news_text}
-
-Highlight the most impactful events. Be concise and actionable for a trader. End with a one-sentence recommendation.
 """
 
-    # 4. Call Groq
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     try:
         completion = groq_client.chat.completions.create(
@@ -93,12 +100,19 @@ Highlight the most impactful events. Be concise and actionable for a trader. End
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
-        digest_body = completion.choices[0].message.content
-        return f"📅 {today_date}\n\n{digest_body}"
+        paragraph = completion.choices[0].message.content
     except Exception as e:
-        return f"❌ LLM failed: {str(e)}"
+        paragraph = f"❌ LLM failed: {str(e)}"
 
-# ---------- Main Polling Loop (simplified commands: digest, /digest, news, /news) ----------
+    if high_impact_events:
+        events_list = "\n".join(f"🔴 {line}" for line in high_impact_events)
+        red_section = f"**Red‑folder news today (IST):**\n{events_list}"
+    else:
+        red_section = "No high‑impact economic events today."
+
+    return f"📅 {today_date}\n\n{red_section}\n\n{paragraph}"
+
+# ---------- Main Polling Loop ----------
 async def main():
     client = MultiServerMCPClient({
         "telegram": {
@@ -116,10 +130,8 @@ async def main():
         print("❌ Required tools not found")
         return
 
-    # Allowed commands (case‑insensitive)
     allowed_commands = {"digest", "/digest", "news", "/news"}
-
-    print("Listening for messages... Send 'digest' or 'news' to get market briefing.\n")
+    print("Listening... Send 'digest' or 'news' (times in IST).\n")
 
     while True:
         result = await poll_tool.ainvoke({})
@@ -144,7 +156,7 @@ async def main():
                 pass
 
         for upd in updates_raw:
-            print(f"📩 Received: {upd}")
+            print(f"📩 {upd}")
             text = upd.get("text", "").strip().lower()
             if text in allowed_commands:
                 print("   → Generating digest...")
