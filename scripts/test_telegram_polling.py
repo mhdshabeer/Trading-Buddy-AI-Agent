@@ -3,87 +3,100 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+import re
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 import httpx
 from groq import Groq
+from faster_whisper import WhisperModel
 import pytz
-import re
 
 load_dotenv()
 
-# ---------- Robust UTC → IST converter (handles ISO and legacy formats) ----------
+# ---------- Whisper model (local) ----------
+WHISPER_MODEL_SIZE = "base"
+model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+
+# ---------- Helper: download voice from Telegram ----------
+async def download_voice_file(bot_token: str, file_id: str) -> bytes:
+    async with httpx.AsyncClient() as client:
+        get_file = await client.get(
+            f"https://api.telegram.org/bot{bot_token}/getFile",
+            params={"file_id": file_id}
+        )
+        file_data = get_file.json()
+        if not file_data.get("ok"):
+            raise Exception(f"Failed to get file: {file_data}")
+        file_path = file_data["result"]["file_path"]
+        download_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+        resp = await client.get(download_url)
+        return resp.content
+
+# ---------- Transcribe voice locally ----------
+async def transcribe_voice(bot_token: str, file_id: str) -> str:
+    ogg_bytes = await download_voice_file(bot_token, file_id)
+    temp_path = f"temp_voice_{file_id}.ogg"
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(ogg_bytes)
+        segments, _ = model.transcribe(temp_path, language="en", beam_size=3)
+        text = " ".join(segment.text for segment in segments)
+        return text if text.strip() else "(no speech detected)"
+    except Exception as e:
+        return f"Transcription error: {e}"
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+# ---------- Digest generation (copied from src.services.digest) ----------
 def utc_to_ist(time_str: str) -> str:
-    """Convert various UTC datetime formats to IST time string (HH:MM AM/PM)."""
     if not time_str or time_str == "Time TBA":
         return "Time TBA"
     try:
-        # Try ISO format with timezone (e.g., 2026-04-19T18:45:00-04:00)
         if 'T' in time_str and ('+' in time_str or '-' in time_str[10:]):
-            dt_utc = datetime.fromisoformat(time_str)
-            # Convert to UTC if it has offset
-            dt_utc = dt_utc.astimezone(timezone.utc)
-        # Try legacy format "YYYY-MM-DD HH:MM:SS"
+            dt_utc = datetime.fromisoformat(time_str).astimezone(pytz.UTC)
         elif re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', time_str):
-            dt_utc = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+            dt_utc = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
         else:
             return "Time TBA"
-        # Convert to IST
         ist = pytz.timezone('Asia/Kolkata')
-        dt_ist = dt_utc.astimezone(ist)
-        return dt_ist.strftime("%I:%M %p").lstrip('0')
-    except Exception:
+        return dt_utc.astimezone(ist).strftime("%I:%M %p").lstrip('0')
+    except:
         return "Time TBA"
 
-# ---------- Digest Generation ----------
 async def generate_digest() -> str:
     today_date = datetime.now().strftime("%A, %B %d, %Y")
     today_str = datetime.now().strftime("%Y-%m-%d")
-
     eco_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     high_impact_events = []
     all_events_summary = []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(eco_url)
-            data = resp.json()
-            today_events = [e for e in data if e.get('date', '')[:10] == today_str]
-            for event in today_events:
-                country = event.get('country', '')
-                title = event.get('title', '')
-                impact = event.get('impact', '')
-                # Use the full datetime from 'date' field (may be ISO)
-                full_datetime = event.get('date', '')
-                time_ist = utc_to_ist(full_datetime)
-                if impact == 'High':
-                    high_impact_events.append(f"{country} - {title} - {time_ist}")
-                all_events_summary.append(f"{country} {title} ({impact} impact)")
-    except Exception as e:
-        high_impact_events = [f"Error fetching calendar: {e}"]
-        all_events_summary = ["Economic data unavailable"]
-
-    # Finnhub news
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(eco_url)
+        data = resp.json()
+        today_events = [e for e in data if e.get('date', '')[:10] == today_str]
+        for event in today_events:
+            country = event.get('country', '')
+            title = event.get('title', '')
+            impact = event.get('impact', '')
+            full_datetime = event.get('date', '')
+            time_ist = utc_to_ist(full_datetime)
+            if impact == 'High':
+                high_impact_events.append(f"{country} - {title} - {time_ist}")
+            all_events_summary.append(f"{country} {title} ({impact} impact)")
     finnhub_key = os.getenv("FINNHUB_API_KEY")
     news_items = []
     if finnhub_key:
         news_url = f"https://finnhub.io/api/v1/news?category=forex&token={finnhub_key}"
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(news_url)
-                articles = resp.json()
-                for art in articles[:3]:
-                    news_items.append(f"- {art['headline']}")
-        except Exception as e:
-            news_items = [f"Error fetching news: {e}"]
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(news_url)
+            articles = resp.json()
+            for art in articles[:3]:
+                news_items.append(f"- {art['headline']}")
     else:
-        news_items = ["No Finnhub API key found. Skipping news."]
-
-    # LLM prompt
+        news_items = ["No Finnhub API key found."]
     eco_summary = "\n".join(all_events_summary) if all_events_summary else "No economic events today."
     news_text = "\n".join(news_items) if news_items else "No news available."
-
     prompt = f"""You are a trading assistant. Based on the following economic events and market news, write ONE short paragraph (max 100 words) describing the current economic state and what traders should watch. Do NOT list the events again. End with a one-sentence actionable recommendation.
 
 Economic events today:
@@ -92,27 +105,21 @@ Economic events today:
 Market news:
 {news_text}
 """
-
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-        )
-        paragraph = completion.choices[0].message.content
-    except Exception as e:
-        paragraph = f"❌ LLM failed: {str(e)}"
-
+    completion = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    paragraph = completion.choices[0].message.content
     if high_impact_events:
         events_list = "\n".join(f"🔴 {line}" for line in high_impact_events)
         red_section = f"**Red‑folder news today (IST):**\n{events_list}"
     else:
         red_section = "No high‑impact economic events today."
-
     return f"📅 {today_date}\n\n{red_section}\n\n{paragraph}"
 
-# ---------- Main Polling Loop ----------
+# ---------- Main polling loop ----------
 async def main():
     client = MultiServerMCPClient({
         "telegram": {
@@ -130,8 +137,9 @@ async def main():
         print("❌ Required tools not found")
         return
 
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     allowed_commands = {"digest", "/digest", "news", "/news"}
-    print("Listening... Send 'digest' or 'news' (times in IST).\n")
+    print("Listening for messages... (voice transcription uses local Whisper)\n")
 
     while True:
         result = await poll_tool.ainvoke({})
@@ -156,13 +164,28 @@ async def main():
                 pass
 
         for upd in updates_raw:
-            print(f"📩 {upd}")
-            text = upd.get("text", "").strip().lower()
-            if text in allowed_commands:
-                print("   → Generating digest...")
-                digest = await generate_digest()
-                await send_tool.ainvoke({"text": digest})
-                print("   → Digest sent.")
+            msg_type = upd.get("type")
+            print(f"📩 Received: {upd}")
+
+            if msg_type == "text":
+                text = upd.get("text", "").strip().lower()
+                if text in allowed_commands:
+                    print("   → Generating digest...")
+                    digest = await generate_digest()
+                    await send_tool.ainvoke({"text": digest})
+                    print("   → Digest sent.")
+                else:
+                    print(f"   → Text (not a command): {text}")
+                    # Future: handle text psychology responses
+
+            elif msg_type == "voice":
+                file_id = upd.get("file_id")
+                print("   → Voice message detected, transcribing locally...")
+                transcript = await transcribe_voice(bot_token, file_id)
+                print(f"   → Transcription: {transcript}")
+                await send_tool.ainvoke({"text": f"📝 Transcription:\n{transcript}"})
+            else:
+                print(f"   → Unhandled type: {msg_type}")
 
         await asyncio.sleep(2)
 
