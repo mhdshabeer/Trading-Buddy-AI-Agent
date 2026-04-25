@@ -1,6 +1,6 @@
 # Trading Buddy AI
 
-An AI-powered trading assistant that journals trades via voice, provides on‑demand market digests, and answers analytics queries. Built with Groq LLM, LangChain, MCP (Model Context Protocol), MT5, PostgreSQL, Notion, and Telegram.
+An AI-powered trading assistant that journals trades via voice, provides on‑demand market digests, and answers analytics queries. Built with Groq LLM, LangChain, MCP (Model Context Protocol), MT5, PostgreSQL, Notion, & Telegram.
 
 ---
 
