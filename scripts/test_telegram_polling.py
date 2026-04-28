@@ -18,11 +18,11 @@ load_dotenv()
 WHISPER_MODEL_SIZE = "base"
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
-# ---------- State ----------
+# ---------- State management ----------
 awaiting_psychology = False
 pending_trade = None   # MT5 trade data (auto fields)
 
-# ---------- Voice helpers (same as before) ----------
+# ---------- Helper: download voice from Telegram ----------
 async def download_voice_file(bot_token: str, file_id: str) -> bytes:
     async with httpx.AsyncClient() as client:
         get_file = await client.get(
@@ -37,6 +37,7 @@ async def download_voice_file(bot_token: str, file_id: str) -> bytes:
         resp = await client.get(download_url)
         return resp.content
 
+# ---------- Transcribe voice locally ----------
 async def transcribe_voice(bot_token: str, file_id: str) -> str:
     ogg_bytes = await download_voice_file(bot_token, file_id)
     temp_path = f"temp_voice_{file_id}.ogg"
@@ -152,30 +153,40 @@ Market news:
         red_section = "No high‑impact economic events today."
     return f"📅 {today_date}\n\n{red_section}\n\n{paragraph}"
 
-# ---------- Main polling loop ----------
+# ---------- Main polling loop with PostgreSQL MCP ----------
 async def main():
     global awaiting_psychology, pending_trade
 
+    # Create a single MCP client that can connect to both Telegram and PostgreSQL servers
+    # We'll start with Telegram, then add PostgreSQL tools later
     client = MultiServerMCPClient({
         "telegram": {
             "command": sys.executable,
             "args": ["src/mcp_servers/telegram_mcp.py"],
             "transport": "stdio"
+        },
+        "postgresql": {
+            "command": sys.executable,
+            "args": ["src/mcp_servers/postgresql_mcp.py"],
+            "transport": "stdio"
         }
     })
 
+    # Get all tools from both MCP servers
     tools = await client.get_tools()
     poll_tool = next((t for t in tools if t.name == "poll_updates"), None)
     send_tool = next((t for t in tools if t.name == "send_message"), None)
+    insert_tool = next((t for t in tools if t.name == "insert_trade"), None)
 
-    if not poll_tool or not send_tool:
-        print("❌ Required tools not found")
+    if not poll_tool or not send_tool or not insert_tool:
+        print("❌ Required tools not found (telegram poll/send or postgresql insert)")
         return
 
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     allowed_commands = {"digest", "/digest", "news", "/news", "simulate", "/simulate"}
 
     print("Listening for messages... Commands: /digest, /simulate (to test journaling)\n")
+    print("PostgreSQL MCP server connected. Trades will be saved to database.\n")
 
     while True:
         result = await poll_tool.ainvoke({})
@@ -209,7 +220,7 @@ async def main():
                 if text in ["simulate", "/simulate"]:
                     # Simulated MT5 trade data (auto fields)
                     pending_trade = {
-                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "trade_date": datetime.now().strftime("%Y-%m-%d"),
                         "asset": "EURUSD",
                         "lot_size": 0.1,
                         "entry_price": 1.0850,
@@ -235,8 +246,10 @@ async def main():
                     # Merge MT5 data with user fields
                     complete_entry = {**pending_trade, **extracted} if pending_trade else extracted
                     print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
-                    # TODO: Save to PostgreSQL + Notion
-                    await send_tool.ainvoke({"text": f"✅ Journal saved. Merged entry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
+                    # Save to PostgreSQL via MCP
+                    db_result = await insert_tool.ainvoke({"trade_data": complete_entry})
+                    print(f"   → DB result: {db_result}")
+                    await send_tool.ainvoke({"text": f"✅ Journal saved.\nDB: {db_result}\nEntry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
                     awaiting_psychology = False
                     pending_trade = None
                     continue
@@ -252,7 +265,9 @@ async def main():
                     extracted = await extract_trade_psychology(transcript)
                     complete_entry = {**pending_trade, **extracted} if pending_trade else extracted
                     print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
-                    await send_tool.ainvoke({"text": f"✅ Journal saved. Merged entry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
+                    db_result = await insert_tool.ainvoke({"trade_data": complete_entry})
+                    print(f"   → DB result: {db_result}")
+                    await send_tool.ainvoke({"text": f"✅ Journal saved.\nDB: {db_result}\nEntry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
                     awaiting_psychology = False
                     pending_trade = None
                 else:
