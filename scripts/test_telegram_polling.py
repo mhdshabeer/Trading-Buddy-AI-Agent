@@ -18,11 +18,11 @@ load_dotenv()
 WHISPER_MODEL_SIZE = "base"
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
-# ---------- State management ----------
+# ---------- State ----------
 awaiting_psychology = False
-pending_trade = None   # will store trade details (symbol, profit, etc.)
+pending_trade = None   # MT5 trade data (auto fields)
 
-# ---------- Helper: download voice from Telegram ----------
+# ---------- Voice helpers (same as before) ----------
 async def download_voice_file(bot_token: str, file_id: str) -> bytes:
     async with httpx.AsyncClient() as client:
         get_file = await client.get(
@@ -37,7 +37,6 @@ async def download_voice_file(bot_token: str, file_id: str) -> bytes:
         resp = await client.get(download_url)
         return resp.content
 
-# ---------- Transcribe voice locally ----------
 async def transcribe_voice(bot_token: str, file_id: str) -> str:
     ogg_bytes = await download_voice_file(bot_token, file_id)
     temp_path = f"temp_voice_{file_id}.ogg"
@@ -53,19 +52,18 @@ async def transcribe_voice(bot_token: str, file_id: str) -> str:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
-# ---------- Extract trade psychology using Groq LLM ----------
+# ---------- Extract only user psychology fields ----------
 async def extract_trade_psychology(text: str) -> dict:
-    prompt = f"""You are a trading journal assistant. Extract the following fields from the user's text. Return ONLY valid JSON, no extra text.
+    prompt = f"""You are a trading journal assistant. Extract ONLY the following fields from the user's text. Return ONLY valid JSON, no extra text.
 
 Fields:
-- symbol (string, e.g., "EURUSD")
-- action (string, "buy" or "sell")
-- profit (number, e.g., 120.5)
-- entry_reason (string, e.g., "breakout", "pullback", "fomo")
-- psychology_before (string, e.g., "confident", "anxious")
-- psychology_during (string)
-- psychology_after (string)
-- notes (string, optional)
+- htf_bias (string, "bullish", "bearish", or "neutral")
+- trade_logic (string, short sentence explaining why you took the trade)
+- confluences (string, comma-separated, e.g., "FVG, OB, IFVG")
+- psychology_during (string, how you felt while trade was open)
+- psychology_after (string, how you felt after closing)
+- mistake (string, e.g., "early/rushed entry", "held too long", "greedy", "early sell")
+- learning (string, what to improve next time)
 
 User text: {text}
 
@@ -81,10 +79,10 @@ JSON:
     content = completion.choices[0].message.content
     try:
         return json.loads(content)
-    except:
-        return {"error": "Failed to parse LLM output", "raw": content}
+    except Exception as e:
+        return {"error": "Failed to parse LLM output", "raw": content, "exception": str(e)}
 
-# ---------- Digest generation (copied from src.services.digest) ----------
+# ---------- Digest generation (unchanged) ----------
 def utc_to_ist(time_str: str) -> str:
     if not time_str or time_str == "Time TBA":
         return "Time TBA"
@@ -205,15 +203,22 @@ async def main():
             msg_type = upd.get("type")
             print(f"📩 Received: {upd}")
 
-            # Handle commands
             if msg_type == "text":
                 text = upd.get("text", "").strip().lower()
-                # Simulate trade command (for testing)
+                # Simulate trade (replace with real MT5 polling later)
                 if text in ["simulate", "/simulate"]:
-                    # Create a dummy trade
-                    pending_trade = {"symbol": "EURUSD", "profit": 120.5, "action": "buy"}
+                    # Simulated MT5 trade data (auto fields)
+                    pending_trade = {
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "asset": "EURUSD",
+                        "lot_size": 0.1,
+                        "entry_price": 1.0850,
+                        "exit_price": 1.0875,
+                        "direction": "long",
+                        "profit_loss": 120.50
+                    }
                     awaiting_psychology = True
-                    await send_tool.ainvoke({"text": "📊 *Trade closed:* EURUSD +$120.50\nPlease explain your entry reason and psychology (voice or text)."})
+                    await send_tool.ainvoke({"text": "📊 *Trade closed:* EURUSD +$120.50\nPlease explain your HTF bias, trade logic, confluences, psychology, mistake, and learning (voice or text)."})
                     print("   → Simulated trade, awaiting psychology...")
                     continue
                 # Digest command
@@ -223,17 +228,18 @@ async def main():
                     await send_tool.ainvoke({"text": digest})
                     print("   → Digest sent.")
                     continue
-                # If awaiting psychology, process as journal entry
+                # Awaiting psychology
                 if awaiting_psychology:
                     print("   → Processing as psychology entry (text)...")
                     extracted = await extract_trade_psychology(text)
-                    print(f"   → Extracted: {json.dumps(extracted, indent=2)}")
-                    # Here you would store to PostgreSQL + Notion later
-                    await send_tool.ainvoke({"text": f"✅ Journal saved. Extracted: {json.dumps(extracted)}"})
+                    # Merge MT5 data with user fields
+                    complete_entry = {**pending_trade, **extracted} if pending_trade else extracted
+                    print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
+                    # TODO: Save to PostgreSQL + Notion
+                    await send_tool.ainvoke({"text": f"✅ Journal saved. Merged entry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
                     awaiting_psychology = False
                     pending_trade = None
                     continue
-                # Otherwise just echo
                 print(f"   → Text (not a command): {text}")
 
             elif msg_type == "voice":
@@ -244,8 +250,9 @@ async def main():
                 if awaiting_psychology:
                     print("   → Processing as psychology entry (voice)...")
                     extracted = await extract_trade_psychology(transcript)
-                    print(f"   → Extracted: {json.dumps(extracted, indent=2)}")
-                    await send_tool.ainvoke({"text": f"✅ Journal saved. Extracted: {json.dumps(extracted)}"})
+                    complete_entry = {**pending_trade, **extracted} if pending_trade else extracted
+                    print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
+                    await send_tool.ainvoke({"text": f"✅ Journal saved. Merged entry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
                     awaiting_psychology = False
                     pending_trade = None
                 else:
