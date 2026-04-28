@@ -1,9 +1,10 @@
-# scripts/test_telegram_polling.py
+# scripts/test_telegram_polling.py (final with ticket persistence)
 import asyncio
 import json
 import os
 import sys
 import re
+from collections import deque
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -14,15 +15,45 @@ import pytz
 
 load_dotenv()
 
-# ---------- Whisper model (local) ----------
+# ---------- Persistence for processed tickets ----------
+PROCESSED_TICKETS_FILE = "processed_tickets.json"
+
+def load_processed_tickets() -> set:
+    """Load the set of processed ticket IDs from a JSON file."""
+    if os.path.exists(PROCESSED_TICKETS_FILE):
+        try:
+            with open(PROCESSED_TICKETS_FILE, "r") as f:
+                data = json.load(f)
+                return set(data)
+        except:
+            return set()
+    return set()
+
+def save_processed_tickets(tickets: set):
+    """Save the set of processed ticket IDs to a JSON file."""
+    with open(PROCESSED_TICKETS_FILE, "w") as f:
+        json.dump(list(tickets), f)
+
+# ---------- Global state ----------
+trade_queue = deque()
+current_trade = None
+awaiting_psychology = False
+processing_lock = asyncio.Lock()
+last_processed_tickets = load_processed_tickets()   # loaded from file
+
+# ---------- Whisper model ----------
 WHISPER_MODEL_SIZE = "base"
 model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
-# ---------- State management ----------
-awaiting_psychology = False
-pending_trade = None   # MT5 trade data (auto fields)
+# ---------- Helper: clean empty strings ----------
+def clean_extracted(data: dict) -> dict:
+    optional_fields = ["htf_bias", "trade_logic", "confluences", "psychology_during", "psychology_after", "mistake", "learning"]
+    for field in optional_fields:
+        if field in data and data[field] == "":
+            data[field] = None
+    return data
 
-# ---------- Helper: download voice from Telegram ----------
+# ---------- Voice helpers ----------
 async def download_voice_file(bot_token: str, file_id: str) -> bytes:
     async with httpx.AsyncClient() as client:
         get_file = await client.get(
@@ -37,7 +68,6 @@ async def download_voice_file(bot_token: str, file_id: str) -> bytes:
         resp = await client.get(download_url)
         return resp.content
 
-# ---------- Transcribe voice locally ----------
 async def transcribe_voice(bot_token: str, file_id: str) -> str:
     ogg_bytes = await download_voice_file(bot_token, file_id)
     temp_path = f"temp_voice_{file_id}.ogg"
@@ -53,12 +83,12 @@ async def transcribe_voice(bot_token: str, file_id: str) -> str:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
-# ---------- Extract only user psychology fields ----------
+# ---------- Extract psychology ----------
 async def extract_trade_psychology(text: str) -> dict:
     prompt = f"""You are a trading journal assistant. Extract ONLY the following fields from the user's text. Return ONLY valid JSON, no extra text.
 
 Fields:
-- htf_bias (string, "bullish", "bearish", or "neutral")
+- htf_bias (string, "bullish", "bearish", or "neutral", if not mentioned use null)
 - trade_logic (string, short sentence explaining why you took the trade)
 - confluences (string, comma-separated, e.g., "FVG, OB, IFVG")
 - psychology_during (string, how you felt while trade was open)
@@ -83,7 +113,7 @@ JSON:
     except Exception as e:
         return {"error": "Failed to parse LLM output", "raw": content, "exception": str(e)}
 
-# ---------- Digest generation (unchanged) ----------
+# ---------- Digest generation ----------
 def utc_to_ist(time_str: str) -> str:
     if not time_str or time_str == "Time TBA":
         return "Time TBA"
@@ -153,12 +183,91 @@ Market news:
         red_section = "No high‑impact economic events today."
     return f"📅 {today_date}\n\n{red_section}\n\n{paragraph}"
 
-# ---------- Main polling loop with PostgreSQL MCP ----------
-async def main():
-    global awaiting_psychology, pending_trade
+# ---------- MT5 polling (with persistence) ----------
+async def mt5_polling_task(mt5_client_tools, send_tool):
+    global trade_queue, last_processed_tickets
+    get_trades_tool = next((t for t in mt5_client_tools if t.name == "get_closed_trades"), None)
+    if not get_trades_tool:
+        print("❌ MT5 polling: get_closed_trades tool not found")
+        return
 
-    # Create a single MCP client that can connect to both Telegram and PostgreSQL servers
-    # We'll start with Telegram, then add PostgreSQL tools later
+    print("MT5 polling started (every 5 seconds)...")
+    while True:
+        try:
+            result = await get_trades_tool.ainvoke({"days_back": 1})
+            content = result.content if hasattr(result, 'content') else result
+            trades = []
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        try:
+                            parsed = json.loads(item["text"])
+                            if isinstance(parsed, list):
+                                trades.extend(parsed)
+                        except:
+                            pass
+            elif isinstance(content, str):
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        trades = parsed
+                except:
+                    pass
+            for trade in trades:
+                profit = trade.get("profit", 0.0)
+                if profit == 0.0:
+                    continue
+                ticket = trade.get("ticket")
+                pos_id = trade.get("position_id", ticket)
+                if pos_id and pos_id not in last_processed_tickets:
+                    last_processed_tickets.add(pos_id)
+                    save_processed_tickets(last_processed_tickets)   # persist immediately
+                    symbol = trade.get("symbol", "UNKNOWN")
+                    action = trade.get("action", "buy")
+                    direction = "long" if action == "buy" else "short"
+                    volume = trade.get("volume", 0.0)
+                    exit_price = trade.get("price", 0.0)
+                    trade_date = datetime.now().strftime("%Y-%m-%d")
+                    pending = {
+                        "trade_date": trade_date,
+                        "asset": symbol,
+                        "lot_size": volume,
+                        "entry_price": exit_price,
+                        "exit_price": exit_price,
+                        "direction": direction,
+                        "profit_loss": profit,
+                        "ticket": ticket
+                    }
+                    trade_queue.append(pending)
+                    print(f"   → Trade {pos_id} (profit: {profit}) added to queue (size: {len(trade_queue)})")
+        except Exception as e:
+            print(f"⚠️ MT5 polling error: {e}")
+        await asyncio.sleep(5)
+
+# ---------- Queue worker ----------
+async def queue_worker(send_tool, insert_tool):
+    global trade_queue, current_trade, awaiting_psychology
+    while True:
+        if not trade_queue:
+            await asyncio.sleep(1)
+            continue
+        async with processing_lock:
+            if current_trade is not None:
+                await asyncio.sleep(1)
+                continue
+            current_trade = trade_queue.popleft()
+        profit = current_trade.get("profit_loss", 0.0)
+        symbol = current_trade.get("asset", "UNKNOWN")
+        profit_str = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
+        await send_tool.ainvoke({"text": f"📊 *Trade closed:* {symbol} {profit_str}\nPlease explain your HTF bias, trade logic, confluences, psychology, mistake, and learning.\nType /skip to skip this trade."})
+        awaiting_psychology = True
+        while awaiting_psychology:
+            await asyncio.sleep(1)
+
+# ---------- Main ----------
+async def main():
+    global awaiting_psychology, current_trade, trade_queue
+
     client = MultiServerMCPClient({
         "telegram": {
             "command": sys.executable,
@@ -169,24 +278,37 @@ async def main():
             "command": sys.executable,
             "args": ["src/mcp_servers/postgresql_mcp.py"],
             "transport": "stdio"
+        },
+        "mt5": {
+            "command": sys.executable,
+            "args": ["src/mcp_servers/mt5_mcp.py"],
+            "transport": "stdio"
         }
     })
 
-    # Get all tools from both MCP servers
     tools = await client.get_tools()
     poll_tool = next((t for t in tools if t.name == "poll_updates"), None)
     send_tool = next((t for t in tools if t.name == "send_message"), None)
     insert_tool = next((t for t in tools if t.name == "insert_trade"), None)
 
     if not poll_tool or not send_tool or not insert_tool:
-        print("❌ Required tools not found (telegram poll/send or postgresql insert)")
+        print("❌ Required tools not found")
         return
 
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    allowed_commands = {"digest", "/digest", "news", "/news", "simulate", "/simulate"}
+    mt5_tools = [t for t in tools if t.name == "get_closed_trades"]
+    if not mt5_tools:
+        print("⚠️ MT5 tools not found, MT5 polling disabled.")
+    else:
+        print("✅ MT5 tools found. Starting MT5 polling and queue worker.")
 
-    print("Listening for messages... Commands: /digest, /simulate (to test journaling)\n")
-    print("PostgreSQL MCP server connected. Trades will be saved to database.\n")
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    allowed_commands = {"digest", "/digest", "news", "/news", "skip", "/skip"}
+
+    print("Listening for messages... Commands: /digest, /news, /skip")
+    print("MT5 polling active. New closed trades will be added to queue and processed one by one.\n")
+
+    mt5_task = asyncio.create_task(mt5_polling_task(mt5_tools, send_tool))
+    queue_task = asyncio.create_task(queue_worker(send_tool, insert_tool))
 
     while True:
         result = await poll_tool.ainvoke({})
@@ -216,42 +338,32 @@ async def main():
 
             if msg_type == "text":
                 text = upd.get("text", "").strip().lower()
-                # Simulate trade (replace with real MT5 polling later)
-                if text in ["simulate", "/simulate"]:
-                    # Simulated MT5 trade data (auto fields)
-                    pending_trade = {
-                        "trade_date": datetime.now().strftime("%Y-%m-%d"),
-                        "asset": "EURUSD",
-                        "lot_size": 0.1,
-                        "entry_price": 1.0850,
-                        "exit_price": 1.0875,
-                        "direction": "long",
-                        "profit_loss": 120.50
-                    }
-                    awaiting_psychology = True
-                    await send_tool.ainvoke({"text": "📊 *Trade closed:* EURUSD +$120.50\nPlease explain your HTF bias, trade logic, confluences, psychology, mistake, and learning (voice or text)."})
-                    print("   → Simulated trade, awaiting psychology...")
+                if text in ["skip", "/skip"]:
+                    if awaiting_psychology and current_trade is not None:
+                        print("   → Skipping current trade")
+                        await send_tool.ainvoke({"text": f"⏭️ Skipped trade {current_trade.get('asset', 'UNKNOWN')}. Moving to next."})
+                        awaiting_psychology = False
+                        current_trade = None
+                    else:
+                        await send_tool.ainvoke({"text": "ℹ️ No pending trade to skip."})
                     continue
-                # Digest command
-                if text in allowed_commands and text not in ["simulate", "/simulate"]:
+                if text in ["digest", "/digest", "news", "/news"]:
                     print("   → Generating digest...")
                     digest = await generate_digest()
                     await send_tool.ainvoke({"text": digest})
                     print("   → Digest sent.")
                     continue
-                # Awaiting psychology
-                if awaiting_psychology:
+                if awaiting_psychology and current_trade is not None:
                     print("   → Processing as psychology entry (text)...")
                     extracted = await extract_trade_psychology(text)
-                    # Merge MT5 data with user fields
-                    complete_entry = {**pending_trade, **extracted} if pending_trade else extracted
+                    extracted = clean_extracted(extracted)
+                    complete_entry = {**current_trade, **extracted}
                     print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
-                    # Save to PostgreSQL via MCP
                     db_result = await insert_tool.ainvoke({"trade_data": complete_entry})
                     print(f"   → DB result: {db_result}")
-                    await send_tool.ainvoke({"text": f"✅ Journal saved.\nDB: {db_result}\nEntry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
+                    await send_tool.ainvoke({"text": f"✅ Journal saved for {current_trade.get('asset')}.\nDB: {db_result}"})
                     awaiting_psychology = False
-                    pending_trade = None
+                    current_trade = None
                     continue
                 print(f"   → Text (not a command): {text}")
 
@@ -260,22 +372,25 @@ async def main():
                 print("   → Voice message detected, transcribing...")
                 transcript = await transcribe_voice(bot_token, file_id)
                 print(f"   → Transcription: {transcript}")
-                if awaiting_psychology:
+                if awaiting_psychology and current_trade is not None:
                     print("   → Processing as psychology entry (voice)...")
                     extracted = await extract_trade_psychology(transcript)
-                    complete_entry = {**pending_trade, **extracted} if pending_trade else extracted
+                    extracted = clean_extracted(extracted)
+                    complete_entry = {**current_trade, **extracted}
                     print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
                     db_result = await insert_tool.ainvoke({"trade_data": complete_entry})
                     print(f"   → DB result: {db_result}")
-                    await send_tool.ainvoke({"text": f"✅ Journal saved.\nDB: {db_result}\nEntry:\n```json\n{json.dumps(complete_entry, indent=2)}\n```"})
+                    await send_tool.ainvoke({"text": f"✅ Journal saved for {current_trade.get('asset')}.\nDB: {db_result}"})
                     awaiting_psychology = False
-                    pending_trade = None
+                    current_trade = None
                 else:
                     await send_tool.ainvoke({"text": f"📝 Transcription:\n{transcript}"})
             else:
                 print(f"   → Unhandled type: {msg_type}")
 
         await asyncio.sleep(2)
+
+    await asyncio.gather(mt5_task, queue_task)
 
 if __name__ == "__main__":
     asyncio.run(main())
