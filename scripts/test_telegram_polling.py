@@ -1,9 +1,10 @@
-# scripts/test_telegram_polling.py (final with ticket persistence)
+# scripts/test_telegram_polling.py (with Notion mirror)
 import asyncio
 import json
 import os
 import sys
 import re
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -244,8 +245,8 @@ async def mt5_polling_task(mt5_client_tools, send_tool):
             print(f"⚠️ MT5 polling error: {e}")
         await asyncio.sleep(5)
 
-# ---------- Queue worker ----------
-async def queue_worker(send_tool, insert_tool):
+# ---------- Queue worker (accepts notion_tool) ----------
+async def queue_worker(send_tool, insert_tool, notion_tool):
     global trade_queue, current_trade, awaiting_psychology
     while True:
         if not trade_queue:
@@ -283,6 +284,11 @@ async def main():
             "command": sys.executable,
             "args": ["src/mcp_servers/mt5_mcp.py"],
             "transport": "stdio"
+        },
+        "notion": {
+            "command": sys.executable,
+            "args": ["src/mcp_servers/notion_mcp.py"],
+            "transport": "stdio"
         }
     })
 
@@ -290,10 +296,16 @@ async def main():
     poll_tool = next((t for t in tools if t.name == "poll_updates"), None)
     send_tool = next((t for t in tools if t.name == "send_message"), None)
     insert_tool = next((t for t in tools if t.name == "insert_trade"), None)
+    notion_tool = next((t for t in tools if t.name == "create_journal_page"), None)
 
     if not poll_tool or not send_tool or not insert_tool:
-        print("❌ Required tools not found")
+        print("❌ Required tools not found (telegram poll/send, postgres insert)")
         return
+
+    if not notion_tool:
+        print("⚠️ Notion tool not found – Notion mirror disabled.")
+    else:
+        print("✅ Notion tool found – journal pages will be mirrored to Notion.")
 
     mt5_tools = [t for t in tools if t.name == "get_closed_trades"]
     if not mt5_tools:
@@ -308,7 +320,7 @@ async def main():
     print("MT5 polling active. New closed trades will be added to queue and processed one by one.\n")
 
     mt5_task = asyncio.create_task(mt5_polling_task(mt5_tools, send_tool))
-    queue_task = asyncio.create_task(queue_worker(send_tool, insert_tool))
+    queue_task = asyncio.create_task(queue_worker(send_tool, insert_tool, notion_tool))
 
     while True:
         result = await poll_tool.ainvoke({})
@@ -358,10 +370,21 @@ async def main():
                     extracted = await extract_trade_psychology(text)
                     extracted = clean_extracted(extracted)
                     complete_entry = {**current_trade, **extracted}
+                    # Generate a unique trade_id
+                    complete_entry["trade_id"] = f"{complete_entry['trade_date']}_{complete_entry['asset']}_{uuid.uuid4().hex[:6]}"
                     print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
+                    # Save to PostgreSQL
                     db_result = await insert_tool.ainvoke({"trade_data": complete_entry})
                     print(f"   → DB result: {db_result}")
-                    await send_tool.ainvoke({"text": f"✅ Journal saved for {current_trade.get('asset')}.\nDB: {db_result}"})
+                    # Save to Notion
+                    notion_msg = ""
+                    if notion_tool:
+                        notion_result = await notion_tool.ainvoke({"trade_data": complete_entry})
+                        print(f"   → Notion result: {notion_result}")
+                        notion_msg = f"\nNotion: {notion_result}"
+                    else:
+                        notion_msg = "\nNotion: disabled"
+                    await send_tool.ainvoke({"text": f"✅ Journal saved for {current_trade.get('asset')}.\nDB: {db_result}{notion_msg}"})
                     awaiting_psychology = False
                     current_trade = None
                     continue
@@ -377,10 +400,18 @@ async def main():
                     extracted = await extract_trade_psychology(transcript)
                     extracted = clean_extracted(extracted)
                     complete_entry = {**current_trade, **extracted}
+                    complete_entry["trade_id"] = f"{complete_entry['trade_date']}_{complete_entry['asset']}_{uuid.uuid4().hex[:6]}"
                     print(f"   → Complete entry: {json.dumps(complete_entry, indent=2)}")
                     db_result = await insert_tool.ainvoke({"trade_data": complete_entry})
                     print(f"   → DB result: {db_result}")
-                    await send_tool.ainvoke({"text": f"✅ Journal saved for {current_trade.get('asset')}.\nDB: {db_result}"})
+                    notion_msg = ""
+                    if notion_tool:
+                        notion_result = await notion_tool.ainvoke({"trade_data": complete_entry})
+                        print(f"   → Notion result: {notion_result}")
+                        notion_msg = f"\nNotion: {notion_result}"
+                    else:
+                        notion_msg = "\nNotion: disabled"
+                    await send_tool.ainvoke({"text": f"✅ Journal saved for {current_trade.get('asset')}.\nDB: {db_result}{notion_msg}"})
                     awaiting_psychology = False
                     current_trade = None
                 else:

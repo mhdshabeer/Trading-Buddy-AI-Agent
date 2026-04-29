@@ -2,12 +2,14 @@
 import asyncio
 import os
 import sys
-from datetime import datetime
 import httpx
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
+from dotenv import load_dotenv
+
+load_dotenv()
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
@@ -18,27 +20,26 @@ if not NOTION_API_KEY or not NOTION_DATABASE_ID:
 
 async def create_journal_page(trade_data: dict) -> str:
     """Create a page in Notion database from trade data."""
-    # Convert trade_data to Notion property format
     # Map direction to title case
-    direction = trade_data.get("direction", "").capitalize()  # "long" -> "Long", "short" -> "Short"
+    direction = trade_data.get("direction", "").capitalize()
     
     properties = {
-        "Trade ID": {"title": [{"text": {"content": trade_data.get("trade_id", "N/A")}}]},
-        "Date": {"date": {"start": trade_data.get("trade_date")}},
-        "Asset": {"select": {"name": trade_data.get("asset", "Unknown")}},
-        "Direction": {"select": {"name": direction}},
-        "Lot Size": {"number": trade_data.get("lot_size", 0)},
-        "Entry Price": {"number": trade_data.get("entry_price", 0)},
-        "Exit Price": {"number": trade_data.get("exit_price", 0)},
-        "Profit/Loss": {"number": trade_data.get("profit_loss", 0)},
-        "HTF Bias": {"select": {"name": trade_data.get("htf_bias", "neutral")}},
-        "Trade Logic": {"rich_text": [{"text": {"content": trade_data.get("trade_logic", "")}}]},
-        "Confluences": {"rich_text": [{"text": {"content": trade_data.get("confluences", "")}}]},
-        "Psychology During": {"select": {"name": trade_data.get("psychology_during", "")}},
-        "Psychology After": {"select": {"name": trade_data.get("psychology_after", "")}},
-        "Mistake": {"select": {"name": trade_data.get("mistake", "none")}},
-        "Learning": {"rich_text": [{"text": {"content": trade_data.get("learning", "")}}]}
-    }
+    "Trade ID": {"title": [{"text": {"content": trade_data.get("trade_id", "N/A")}}]},
+    "Date": {"date": {"start": trade_data.get("trade_date")}},
+    "Asset": {"select": {"name": trade_data.get("asset", "Unknown")}},
+    "Direction": {"select": {"name": direction}},
+    "Lot Size": {"number": trade_data.get("lot_size", 0)},
+    "Entry Price": {"number": trade_data.get("entry_price", 0)},
+    "Exit Price": {"number": trade_data.get("exit_price", 0)},
+    "Profit/Loss": {"number": trade_data.get("profit_loss", 0)},
+    "HTF Bias": {"select": {"name": trade_data.get("htf_bias", "neutral")}},
+    "Trade Logic": {"rich_text": [{"text": {"content": trade_data.get("trade_logic", "")}}]},
+    "Confluences": {"rich_text": [{"text": {"content": trade_data.get("confluences", "")}}]},
+    "Psychology During": {"rich_text": [{"text": {"content": trade_data.get("psychology_during", "")}}]},
+    "Psychology After": {"rich_text": [{"text": {"content": trade_data.get("psychology_after", "")}}]},
+    "Mistake": {"rich_text": [{"text": {"content": trade_data.get("mistake", "")}}]},
+    "Learning": {"rich_text": [{"text": {"content": trade_data.get("learning", "")}}]}
+}
     
     url = "https://api.notion.com/v1/pages"
     headers = {
@@ -52,10 +53,13 @@ async def create_journal_page(trade_data: dict) -> str:
     }
     
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return "✅ Notion page created"
+    except httpx.HTTPStatusError as e:
+        error_body = e.response.text
+        return f"❌ Notion API error (status {e.response.status_code}): {error_body}"
     except Exception as e:
         return f"❌ Notion error: {str(e)}"
 
