@@ -222,8 +222,6 @@ Bot starts. Open MT5, start trading. Everything else is automatic.
 
 - Docker containerisation
 - AWS EC2 deployment (removes Windows dependency)
-- Notion chart screenshot upload
-- Mobile trade sync via MetaApi
 
 ---
 
