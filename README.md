@@ -1,17 +1,62 @@
-# Trading Buddy AI
-### Autonomous AI Trading Journal Agent — Voice, MT5, PostgreSQL, Notion, Telegram
+# Trading Buddy AI  
+Autonomous AI Trading Journal Agent (MT5 + Telegram + LLM + PostgreSQL + Notion)
 
 ---
 
-## What It Does
+## TL;DR
+AI agent that automatically journals your MetaTrader 5 trades via Telegram voice input, extracts structured psychology using LLMs, and stores everything in PostgreSQL + Notion with natural language analytics and on-demand market/news summaries.
 
-Removes all friction from trade journaling.
+---
 
-Trade closes in MT5 → bot detects it within 5 seconds → pings you on Telegram → you send a voice memo → AI transcribes, extracts psychology, saves everything to PostgreSQL and Notion. No spreadsheets, no manual input, no dashboards.
+## Overview
 
-Also answers natural language queries about your trading behavior directly in Telegram:
-> *"What's my win rate when I felt impatient?"*
-> *"Show me total profit for EURUSD last month"*
+Trading Buddy AI removes all friction from trade journaling by automating the entire process — from trade detection to structured logging and analytics.
+
+When a trade closes in MT5, the system:
+- Detects it in real-time  
+- Prompts you via Telegram  
+- Accepts voice or text input  
+- Transcribes and extracts trading psychology using an LLM  
+- Stores structured data for both analytics and review  
+
+No spreadsheets. No manual logging. No missed trades.
+
+---
+
+## Key Features
+
+### Automated Trade Journaling
+- Real-time MT5 trade detection (≈5s latency)
+- Telegram prompts for instant journaling
+- Voice + text input support
+- Zero manual data entry
+
+### AI-Powered Psychology Extraction
+- Voice → text via local transcription (faster-whisper)
+- LLM extracts structured fields:
+  - HTF bias  
+  - Trade logic  
+  - Confluences  
+  - Psychology during & after  
+  - Mistakes & learnings  
+
+### Natural Language Analytics
+Ask questions directly in Telegram:
+- “What’s my win rate when I felt impatient?”
+- “Total profit for EURUSD last month?”
+- “How many trades did I win this week?”
+
+Pipeline:
+NL → SQL → execution → formatted response
+
+### On-Demand Market & News Digest
+- Triggered via `/digest`
+- Aggregates:
+  - Economic calendar (Forex Factory)
+  - Latest forex news (Finnhub)
+- LLM generates a concise, actionable briefing
+- Highlights high-impact events separately
+- Fully on-demand (no spam)
 
 ---
 
@@ -22,148 +67,99 @@ Telegram User
       ↕
 Telegram MCP Server
       ↕
-Orchestrator (async polling loop)
-      ├── MT5 MCP Server         ←→ MetaTrader 5 Terminal (Windows)
-      ├── PostgreSQL MCP Server  ←→ Local PostgreSQL DB
-      ├── Notion MCP Server      ←→ Notion API
+Orchestrator (async event loop)
+      ├── MT5 MCP Server         ↔ MetaTrader 5 Terminal
+      ├── PostgreSQL MCP Server  ↔ Local Database
+      ├── Notion MCP Server      ↔ Notion API
       └── Services:
-            ├── Voice Transcription  (faster-whisper, local)
-            ├── Psychology Extractor (Groq LLM)
-            ├── Market Digest        (Forex Factory + Finnhub + Groq)
-            └── Analytics Queries    (NL → SQL → LLM formatted answer)
+            ├── Transcription      (faster-whisper, local)
+            ├── LLM Processing     (Groq / LLaMA)
+            ├── Market Digest      (Forex Factory + Finnhub)
+            └── Analytics Engine   (NL → SQL → response)
 ```
 
 ---
 
-## Full Trade Journaling Flow
+## Trade Journaling Flow
 
 ```
 MT5 trade closes
       ↓
-MT5 poller detects it within 5 seconds
-(filters zero-profit opening deals, deduplicates via persisted ticket set)
+Detected by polling engine (deduplicated via ticket tracking)
       ↓
-Trade added to queue
+Queued for processing
       ↓
-Queue worker pops one trade, sends Telegram prompt:
-"EURUSD +$120.50 — explain your logic, psychology, mistakes"
+Telegram prompt sent:
+"EURUSD +$120 — explain your logic, psychology, mistakes"
       ↓
-You reply with voice memo or text
+User responds (voice/text)
       ↓
-Voice → faster-whisper transcription (local, zero API cost)
+Voice → transcription (local)
       ↓
-Groq LLM extracts 7 structured fields (JSON schema enforced):
-  htf_bias, trade_logic, confluences,
-  psychology_during, psychology_after,
-  mistake, learning
+LLM extracts structured psychology (JSON schema)
       ↓
-MT5 auto-fields + extracted psychology merged into complete entry
+Merged with MT5 trade data
       ↓
-Saved to PostgreSQL (analytics) + Notion page created (readable mirror)
+Stored in:
+  • PostgreSQL (analytics)
+  • Notion (human-readable journal)
       ↓
-Telegram confirmation sent
+Confirmation sent via Telegram
 ```
-
----
-
-## Analytics Queries
-
-Ask anything about your trading history directly in Telegram:
-
-| You ask | What happens |
-|---------|-------------|
-| "What's my win rate when psychology was scared?" | LLM generates SQL → executes → LLM formats answer |
-| "Show me total profit for EURUSD last month" | LLM generates SQL → executes → LLM formats answer |
-| "How many trades did I win last week?" | Returns: "You won 12 trades in the last 7 days" |
-
-The system generates a PostgreSQL SELECT query from your question, executes it, and returns a clean natural language answer — all without leaving Telegram.
-
----
-
-## Market Digest
-
-Text `/digest` at any time:
-
-```
-/digest
-  ↓
-Fetches today's economic calendar (Forex Factory)
-Fetches latest forex news (Finnhub API)
-Converts event times to IST
-Groq LLM summarises into a short actionable briefing
-  ↓
-Delivered to your Telegram
-```
-
-Red-folder (high-impact) events are listed separately. On-demand only — no scheduled noise.
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|-------|-----------|
-| Orchestration | Python asyncio, LangChain MCP adapters |
-| LLM | Groq (llama-3.3-70b-versatile) |
-| Transcription | faster-whisper (base, CPU, local) |
-| Trading Platform | MetaTrader 5 + Python MT5 library |
-| MCP Framework | mcp Python SDK (stdio transport) |
+|------|-----------|
+| Language | Python |
+| Orchestration | asyncio |
+| LLM | Groq (LLaMA models) |
+| Transcription | faster-whisper (local, CPU) |
+| Trading Platform | MetaTrader 5 (Python API) |
+| Architecture | MCP (Model Context Protocol) |
 | Messaging | Telegram Bot API |
-| Primary Database | PostgreSQL (local) |
-| Mirror | Notion API |
-| HTTP Client | httpx (async) |
-| State Persistence | JSON file (processed_tickets.json) |
+| Database | PostgreSQL |
+| Knowledge Mirror | Notion API |
+| APIs | Finnhub, Forex Factory |
+| HTTP Client | httpx |
 
 ---
 
-## MCP Servers
+## MCP-Based Modular Design
 
-Each integration runs as an isolated subprocess exposing tools via stdio JSON-RPC:
+Each integration runs as an isolated subprocess (JSON-RPC over stdio):
 
-| Server | Tools Exposed |
-|--------|--------------|
-| `telegram_mcp.py` | `send_message`, `poll_updates` |
-| `mt5_mcp.py` | `get_closed_trades`, `get_account_info`, `get_open_positions` |
-| `postgresql_mcp.py` | `insert_trade`, `query_trades` |
-| `notion_mcp.py` | `create_journal_page` |
-
-The orchestrator connects to all four at startup. Each server can be swapped or extended independently without touching the orchestrator.
+| Server | Responsibility |
+|--------|---------------|
+| Telegram MCP | Messaging + polling |
+| MT5 MCP | Trade + account data |
+| PostgreSQL MCP | Data storage + queries |
+| Notion MCP | Journal visualization |
 
 ---
 
-## Key Design Decisions
-
-| Decision | Why |
-|----------|-----|
-| MCP servers as separate processes | Modular — each integration is independent and swappable |
-| No LLM in polling loop | Prevents unwanted replies; LLM only activates when a decision is needed |
-| Local faster-whisper transcription | Zero API cost, no latency, no internet dependency for transcription |
-| Trade queue (one at a time) | Multiple simultaneous closures handled cleanly — no mixed psychology notes |
-| PostgreSQL + Notion dual storage | PostgreSQL for unlimited analytics queries; Notion for human-readable review |
-| Persistent processed_tickets.json | Survives restarts — no duplicate prompts for already-journaled trades |
-
----
-
-## Database Schema (trades table)
+## Database Schema (Trades)
 
 ```sql
 CREATE TABLE trades (
-    id              VARCHAR PRIMARY KEY,
-    trade_date      DATE,
-    asset           VARCHAR,
-    direction       VARCHAR CHECK (direction IN ('long', 'short')),
-    lot_size        FLOAT,
-    entry_price     FLOAT,
-    exit_price      FLOAT,
-    profit_loss     FLOAT,
-    htf_bias        VARCHAR,
-    trade_logic     TEXT,
-    confluences     VARCHAR,
+    id VARCHAR PRIMARY KEY,
+    trade_date DATE,
+    asset VARCHAR,
+    direction VARCHAR,
+    lot_size FLOAT,
+    entry_price FLOAT,
+    exit_price FLOAT,
+    profit_loss FLOAT,
+    htf_bias VARCHAR,
+    trade_logic TEXT,
+    confluences VARCHAR,
     psychology_during VARCHAR,
-    psychology_after  VARCHAR,
-    mistake         VARCHAR,
-    learning        TEXT,
-    created_at      TIMESTAMP DEFAULT NOW()
+    psychology_after VARCHAR,
+    mistake VARCHAR,
+    learning TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
 );
 ```
 
@@ -171,64 +167,95 @@ CREATE TABLE trades (
 
 ## Running Locally
 
-**Requirements:**
-- Windows (MT5 Python library is Windows-only)
-- MetaTrader 5 terminal open and logged in
+### Requirements
+- Windows (required for MT5 Python API)
+- MetaTrader 5 terminal running
 - Python 3.11+
-- PostgreSQL running locally
-- Telegram bot token + chat ID
+- PostgreSQL
+- Telegram bot credentials
 
-**Setup:**
+### Setup
+
 ```bash
 git clone https://github.com/mhdshabeer/Trading-Buddy-AI-Agent.git
 cd Trading-Buddy-AI-Agent
 pip install -r requirements.txt
 cp .env.example .env
-# fill in your API keys in .env
 ```
 
-**Environment variables (.env):**
+Fill `.env`:
+
 ```
-GROQ_API_KEY=
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
+GROQ_API_KEY = 
+mt5_ID = 
+mt5_PASSWORD = 
+TELEGRAM_BOT_TOKEN = 
+TELEGRAM_CHAT_ID = 
+FINNHUB_API_KEY=
+POSTGRES_HOST=
+POSTGRES_PORT=
+POSTGRES_DB=
+POSTGRES_USER=
+POSTGRES_PASSWORD=
 NOTION_API_KEY=
 NOTION_DATABASE_ID=
-FINNHUB_API_KEY=
-DATABASE_URL=postgresql://localhost/trading_buddy
 ```
 
-**Run:**
+### Run
+
 ```bash
-python src/agent/orchestrator.py
+python src/main.py
 ```
-
-Bot starts. Open MT5, start trading. Everything else is automatic.
 
 ---
 
 ## Commands
 
-| Command | What it does |
-|---------|-------------|
-| `/digest` | Fetches today's economic events + news, returns LLM summary |
-| `/skip` | Skips current trade journal prompt, moves to next in queue |
-| Any question | Treated as analytics query — LLM generates SQL, returns answer |
-| Voice memo | Transcribed and used as journal entry if bot is awaiting psychology |
+| Command | Description |
+|--------|------------|
+| `/digest` | Market + news summary |
+| `/skip` | Skip current trade |
+| Any question | Triggers analytics query |
+| Voice note | Used for journaling |
 
 ---
 
-## What's Next (v2)
+## Key Design Decisions
 
-- Docker containerisation
-- AWS EC2 deployment (removes Windows dependency)
+- No LLM in polling loop → avoids unnecessary computation  
+- Local transcription → zero API cost, faster, private  
+- Queue-based journaling → prevents overlapping trade logs  
+- Dual storage (PostgreSQL + Notion)  
+- Persistent trade tracking → prevents duplicate entries  
 
 ---
 
 ## Project Status
 
-Core journaling loop, market digest, and analytics queries are fully working locally. PostgreSQL storage and Notion mirror both operational. Built and tested over 3 weeks as a real tool for personal use.
+Core system fully functional:
+- Trade detection  
+- Voice journaling  
+- Psychology extraction  
+- Analytics queries  
+- Market/news digest  
+
+Built and tested on real MT5 trades, Telegram interactions, and a live PostgreSQL database.
 
 ---
 
-*Built to solve a real problem. Every component you see was debugged against actual MT5 data, real Telegram voice memos, and a live PostgreSQL instance.*
+## Roadmap (v2)
+
+- Docker containerization  
+- Cloud deployment (AWS EC2)  
+
+---
+
+## License
+
+MIT License
+
+---
+
+## Author
+
+Mohammed Shabeer
